@@ -1,5 +1,5 @@
 /*
- * nvcc -O3 -std=c++17 -Xcompiler "/Zc:__cplusplus" -arch=compute_75 -Invidia-mathdx-24.08.0/nvidia/mathdx/24.08/include/ kernel.cu -o primes_program && primes_program.exe
+ * nvcc -O3 -std=c++17 -arch=compute_80 -Invidia-mathdx-25.01.1/nvidia/mathdx/25.01/include primes.cu -o primes_program && ./primes_program 
  */
 
 #include <chrono>
@@ -17,7 +17,10 @@
 #include <stdio.h>
 #include <cassert>
 #include <bitset>
-
+#include <filesystem>
+#include <thread>
+#include <mutex>
+#include <atomic>
 #include <ciso646> // fix missing `not` for `fft_execution.hpp`
 #define CUFFTDX_DISABLE_CUTLASS_DEPENDENCY
 #include <cufftdx.hpp>
@@ -29,18 +32,18 @@
 using namespace cufftdx;
 
 #define WARP_SIZE 32
-#define HASH_MULTIPLIER 0x27D4EB2D
 #define PRIME_LOWER_BOUND (1 << 29)
-#define VALID_PAIR_COUNT_BUFFER_SIZE (1 << 26)
+#define VALID_PAIR_COUNT_BUFFER_SIZE (1 << 25)
 #define PAIR_SCORE_BUFFER_SIZE (1 << 30)
 #define MAX_SCORED_PRIME_COUNT (1 << 19)
-#define EXECUTE_TEST_RUN true
+#define EXECUTE_TEST_RUN false
 
 #define BIT_RANGE 31
 #define HASH_RANGE_1D 32
 #define HASH_RANGE_2D 32
 
 #define TARGET_PRIME_GROUP_SIZE 4
+#define COMBINATIONS_TO_OUTPUT 100
 
 using FFT_B = decltype(Thread() + Size<BIT_RANGE>() + Precision<float>() + Type<fft_type::c2c>() + Direction<fft_direction::forward>());
 using FFT_XY = decltype(Thread() + Size<HASH_RANGE_2D * 2>() + Precision<float>() + Type<fft_type::c2c>() + Direction<fft_direction::forward>());
@@ -61,8 +64,7 @@ public:
 using primePairHeapEntry = heapEntry<float, pair<int>>;
 
 bool fileExists(const std::string& filename) {
-    struct stat buffer;
-    return (stat(filename.c_str(), &buffer) == 0);
+    return std::filesystem::exists(filename);
 }
 
 template<int InterleaveStride>
@@ -286,7 +288,7 @@ __global__ void narrowPrimesKernel(int* d_primes, int primeCount, size_t batchSi
     
     extern __shared__ uint8_t sharedMemoryStart[];
     narrowPrimes_sharedMemoryPointers shared = narrowPrimes_sharedMemoryPointers::allocate(&sharedMemoryStart[0], blockDim.y);
-    
+
     if (threadIdx.x == 0) {
         shared.warpActiveLoopThreadMasksPtr[threadIdx.y] = 0xFFFFFFFF;
     }
@@ -322,7 +324,7 @@ __global__ void narrowPrimesKernel(int* d_primes, int primeCount, size_t batchSi
             for (int bitIndex = 0; bitIndex < BIT_RANGE; bitIndex++) {
                 int bufferIndexWithXB = bitIndex + bufferIndexWithX;
                 float value = (hashShifted & 1) ? -1.0f : 1.0f;
-                buffer[bufferIndexWithXB] = complex_type{ value, 0 };
+                buffer[bufferIndexWithXB] = complex_type{ value, 0.0f };
                 hashShifted >>= 1;
             }
             xorBase += prime;
@@ -336,7 +338,7 @@ __global__ void narrowPrimesKernel(int* d_primes, int primeCount, size_t batchSi
         for (int bitIndex = 0; bitIndex < BIT_RANGE; bitIndex++) {
             int bufferIndexWithB = bitIndex;
             for (int xBufferIndex = 0; xBufferIndex < HASH_RANGE_1D; xBufferIndex++) buffer_local_double[xBufferIndex] = buffer[bufferIndexWithB + xBufferIndex * BIT_RANGE];
-            for (int xBufferIndex = HASH_RANGE_1D; xBufferIndex < HASH_RANGE_1D * 2; xBufferIndex++) buffer_local_double[xBufferIndex] = complex_type{ 0, 0 };
+            for (int xBufferIndex = HASH_RANGE_1D; xBufferIndex < HASH_RANGE_1D * 2; xBufferIndex++) buffer_local_double[xBufferIndex] = complex_type{ 0.0, 0.0 };
             FFT_XY().execute(&buffer_local_double[0]);
             //for (int xBufferIndex = 0; xBufferIndex < HASH_RANGE_1D; xBufferIndex++) buffer[bufferIndexWithB + xBufferIndex * BIT_RANGE] = buffer_local_double[xBufferIndex];
             // Use the values directly instead.
@@ -390,7 +392,8 @@ std::vector<uint> narrowPrimes(cudaDeviceProp& deviceProp, std::vector<uint>& pr
         int primeStartConsidered = primeLowerBoundIndex - primes.begin();
         int primeCountConsidered = primes.end() - primeLowerBoundIndex;
         
-        std::cout << "Prime lower bound of 0x" << std::hex << std::uppercase << PRIME_LOWER_BOUND << " applied; consideration size truncated to: " << std::dec << primeCountConsidered << std::endl;
+        std::cout << "Prime count: " << primes.size() << std::endl;
+        std::cout << "Prime lower bound of 0x" << std::hex << std::uppercase << PRIME_LOWER_BOUND << " applied; consideration size truncated to: " << std::dec << primeCountConsidered << " (" << (primeCountConsidered * 100.0 / primes.size()) << "%)" << std::endl;
         std::cout << "First prime: " << primes[primeStartConsidered] << " (0x" << std::hex << std::uppercase << primes[primeStartConsidered] << ")" << std::dec << std::endl;
 
         int blockCount = 0;
@@ -839,7 +842,7 @@ __global__ void rankPrimePairsKernel(uint* d_primesForMultiplierGroups, multipli
 				for (int bitIndex = 0; bitIndex < BIT_RANGE; bitIndex++) {
 					int bufferIndexWithXYB = bitIndex + bufferIndexWithXY;
 					float value = (hashShifted & 1) ? -1.0f : 1.0f;
-					buffer[bufferIndexWithXYB] = complex_type{ value, 0 };
+					buffer[bufferIndexWithXYB] = complex_type{ value, 0.0f };
 					hashShifted >>= 1;
 				}
 				xorAdd += primeB;
@@ -853,7 +856,7 @@ __global__ void rankPrimePairsKernel(uint* d_primesForMultiplierGroups, multipli
 			for (int bitIndex = 0; bitIndex < BIT_RANGE; bitIndex++) {
 				int bufferIndexWithXB = bitIndex + bufferIndexWithX;
 				for (int yBufferIndex = 0; yBufferIndex < HASH_RANGE_2D; yBufferIndex++) buffer_local_double[yBufferIndex] = buffer[bufferIndexWithXB + yBufferIndex * BIT_RANGE];
-                for (int yBufferIndex = HASH_RANGE_2D; yBufferIndex < HASH_RANGE_2D * 2; yBufferIndex++) buffer_local_double[yBufferIndex] = complex_type{ 0, 0 };
+                for (int yBufferIndex = HASH_RANGE_2D; yBufferIndex < HASH_RANGE_2D * 2; yBufferIndex++) buffer_local_double[yBufferIndex] = complex_type{ 0.0, 0.0 };
 				FFT_XY().execute(&buffer_local_double[0]);
 				for (int yBufferIndex = 0; yBufferIndex < HASH_RANGE_2D; yBufferIndex++) buffer[bufferIndexWithXB + yBufferIndex * BIT_RANGE] = buffer_local_double[yBufferIndex];
 			}
@@ -866,7 +869,7 @@ __global__ void rankPrimePairsKernel(uint* d_primesForMultiplierGroups, multipli
 			for (int bitIndex = 0; bitIndex < BIT_RANGE; bitIndex++) {
 				int bufferIndexWithYB = bitIndex + bufferIndexWithY;
 				for (int xBufferIndex = 0; xBufferIndex < HASH_RANGE_2D; xBufferIndex++) buffer_local_double[xBufferIndex] = buffer[bufferIndexWithYB + xBufferIndex * (HASH_RANGE_2D * BIT_RANGE)];
-                for (int xBufferIndex = HASH_RANGE_2D; xBufferIndex < HASH_RANGE_2D * 2; xBufferIndex++) buffer_local_double[xBufferIndex] = complex_type{ 0, 0 };
+                for (int xBufferIndex = HASH_RANGE_2D; xBufferIndex < HASH_RANGE_2D * 2; xBufferIndex++) buffer_local_double[xBufferIndex] = complex_type{ 0.0, 0.0 };
 				FFT_XY().execute(&buffer_local_double[0]);
                 // for (int xBufferIndex = 0; xBufferIndex < HASH_RANGE_2D; xBufferIndex++) buffer[bufferIndexWithYB + xBufferIndex * (HASH_RANGE_2D * BIT_RANGE)] = buffer_local_double[xBufferIndex];
                 // Use the values directly instead.
@@ -909,6 +912,14 @@ size_t populateThreadStartIndices(std::vector<batchStartIndex>& threadStartIndic
     size_t batchSizeThisIteration = (cumulativePairCountThisIteration + threadCount - 1) / threadCount;
     
     int iThread = 0;
+    // Make sure we don't go out of bounds
+    if (iMultiplierGroup >= multiplierGroups.size()) {
+        for (iThread = 0; iThread < threadCount; iThread++) {
+            threadStartIndices[iThread] = { multiplierGroups.size(), 0 };
+        }
+        return batchSizeThisIteration;
+    }
+    
     multiplierGroup multiplierGroup = multiplierGroups[iMultiplierGroup];
     int pairCount = multiplierGroup.primeCount * (multiplierGroup.primeCount - 1) / 2;
     
@@ -956,7 +967,7 @@ void runRankPrimePairsKernel(size_t pairScoreBufferSize, int cumulativePairCount
     for (size_t cumulativePairCountProgress = 0; cumulativePairCountProgress < cumulativePairCount; ) {
         size_t cumulativePairCountThisIteration = std::min(cumulativePairCount - cumulativePairCountProgress, pairScoreBufferSize);
         size_t batchSizeThisIteration = populateThreadStartIndices(threadStartIndices, iMultiplierGroup, multiplierGroups, cumulativePairCountThisIteration, cumulativePairCountProgress);
-            size_t totalCoverageThisIteration = batchSizeThisIteration * threadCount;
+        size_t totalCoverageThisIteration = batchSizeThisIteration * threadCount;
         
         if (!IsTest) {
             std::cout << "Batch size this iteration: " << batchSizeThisIteration << std::endl;
@@ -981,6 +992,7 @@ void runRankPrimePairsKernel(size_t pairScoreBufferSize, int cumulativePairCount
         cudaEventElapsedTime(&time, start, stop);
         if (!IsTest) printf("Completed. Kernel elapsed time: %.3f s \n", time / 1000);
         
+        // When processing chunks, we need to copy to the correct offset in the scores array
         cudaMemcpy(scores.data() + cumulativePairCountProgress, d_scores, cumulativePairCountThisIteration * sizeof(float), cudaMemcpyDeviceToHost);
         
         cumulativePairCountProgress += cumulativePairCountThisIteration;
@@ -1053,20 +1065,28 @@ primeMultiplierPairRanking rankPrimePairs(cudaDeviceProp& deviceProp, std::vecto
         std::cout << "CUDA thread count: " << blockCount << " * " << threadsPerBlock << " = " << threadCount << std::endl;
         
         uint* d_primesForMultiplierGroups;
-        cudaMalloc((void**)&d_primesForMultiplierGroups, primesForMultiplierGroups.size() * sizeof(uint));
-        cudaMemcpy(d_primesForMultiplierGroups, primesForMultiplierGroups.data(), primesForMultiplierGroups.size() * sizeof(uint), cudaMemcpyHostToDevice);
+        size_t primesSize = primesForMultiplierGroups.size() * sizeof(uint);
+        std::cout << "Allocating " << (primesSize / (1024.0 * 1024.0)) << " MB for primes array" << std::endl;
+        cudaMalloc((void**)&d_primesForMultiplierGroups, primesSize);
+        cudaMemcpy(d_primesForMultiplierGroups, primesForMultiplierGroups.data(), primesSize, cudaMemcpyHostToDevice);
         
         multiplierGroup* d_multiplierGroups;
-        cudaMalloc((void**)&d_multiplierGroups, multiplierGroups.size() * sizeof(multiplierGroup));
-        cudaMemcpy(d_multiplierGroups, multiplierGroups.data(), multiplierGroups.size() * sizeof(multiplierGroup), cudaMemcpyHostToDevice);
+        size_t groupsSize = multiplierGroups.size() * sizeof(multiplierGroup);
+        std::cout << "Allocating " << (groupsSize / (1024.0 * 1024.0)) << " MB for multiplier groups array" << std::endl;
+        cudaMalloc((void**)&d_multiplierGroups, groupsSize);
+        cudaMemcpy(d_multiplierGroups, multiplierGroups.data(), groupsSize, cudaMemcpyHostToDevice);
         
         scores.resize(cumulativePairCount);
         float* d_scores;
-        cudaMalloc((void**)&d_scores, std::min(cumulativePairCount, (size_t)PAIR_SCORE_BUFFER_SIZE) * sizeof(float));
+        size_t scoresSize = std::min(cumulativePairCount, (size_t)PAIR_SCORE_BUFFER_SIZE) * sizeof(float);
+        std::cout << "Allocating " << (scoresSize / (1024.0 * 1024.0)) << " MB for scores array" << std::endl;
+        cudaMalloc((void**)&d_scores, scoresSize);
         
         std::vector<batchStartIndex> threadStartIndices(threadCount);
         batchStartIndex* d_threadStartIndices;
-        cudaMalloc((void**)&d_threadStartIndices, threadStartIndices.size() * sizeof(batchStartIndex));
+        size_t indicesSize = threadStartIndices.size() * sizeof(batchStartIndex);
+        std::cout << "Allocating " << (indicesSize / (1024.0 * 1024.0)) << " MB for thread start indices array" << std::endl;
+        cudaMalloc((void**)&d_threadStartIndices, indicesSize);
         
         runRankPrimePairsKernel(PAIR_SCORE_BUFFER_SIZE, cumulativePairCount, threadStartIndices, d_threadStartIndices, multiplierGroups, d_multiplierGroups,
             d_primesForMultiplierGroups, scores, d_scores, blockCount, warpsPerBlock, sharedMemorySizePerBlock);
@@ -1074,6 +1094,7 @@ primeMultiplierPairRanking rankPrimePairs(cudaDeviceProp& deviceProp, std::vecto
         cudaFree(d_scores);
         cudaFree(d_multiplierGroups);
         cudaFree(d_primesForMultiplierGroups);
+        cudaFree(d_threadStartIndices);
 
         std::ofstream outFile(filename, std::ios::binary);
         if (outFile.is_open()) {
@@ -1139,17 +1160,22 @@ __inline__ int countCombinations(int memberCount, int cardinality) {
     return combinationCountHere;
 }
 
+struct threadBestCombinations {
+    std::vector<indexedScoreMultiplierPairEntry> combinations;
+    std::vector<uint> primes;
+};
+
 combinationScorecard getBestCombinations(primeMultiplierPairRanking& primeMultiplierPairRanking, int cardinality) {
-    
     std::vector<scoredInteger> sortedScoreMultiplierPairs;
     std::vector<uint> sortedPrimeCombinations;
     
-    const std::string filename = "finalCombinations_" + std::to_string(cardinality) + "_" + std::to_string(primeMultiplierPairRanking.multiplierGroups.size()) + "_" +
-        std::to_string(primeMultiplierPairRanking.primesForMultiplierGroups.size()) + "_" + std::to_string(primeMultiplierPairRanking.scores.size()) + "_" +
+    const std::string filename = "finalCombinations_" + std::to_string(cardinality) + "_" + std::to_string(COMBINATIONS_TO_OUTPUT) + "_" + 
+        std::to_string(primeMultiplierPairRanking.multiplierGroups.size()) + "_" +
+        std::to_string(primeMultiplierPairRanking.primesForMultiplierGroups.size()) + "_" + 
+        std::to_string(primeMultiplierPairRanking.scores.size()) + "_" +
         std::to_string(HASH_RANGE_1D) + ".bin";
     
-    if (!fileExists(filename)) {
-    
+    if (!fileExists(filename)) {       
         size_t combinationCountTotal = 0;
         for (int iGroup = 0; iGroup < primeMultiplierPairRanking.multiplierGroups.size(); iGroup++) {
             multiplierGroup multiplierGroup = primeMultiplierPairRanking.multiplierGroups[iGroup];
@@ -1157,97 +1183,160 @@ combinationScorecard getBestCombinations(primeMultiplierPairRanking& primeMultip
             combinationCountTotal += combinationCountHere;
         }
         
-        std::vector<int> groupPrimeIndices(cardinality);
-        std::vector<scoredInteger> primeCombinations(combinationCountTotal * cardinality);
-        std::vector<indexedScoreMultiplierPairEntry> indexedScoreMultiplierPairEntries(combinationCountTotal);
-        
         std::cout << "Total combinations: " << std::to_string(combinationCountTotal) << " (cardinality: " << cardinality << ")" << std::endl;
-        
-        size_t iCombination = 0;
-        for (size_t iGroup = 0; iGroup < primeMultiplierPairRanking.multiplierGroups.size(); iGroup++) {
-            multiplierGroup& multiplierGroup = primeMultiplierPairRanking.multiplierGroups[iGroup];
-            if (multiplierGroup.primeCount < cardinality) continue;
-            
-            for (int i = 0; i < cardinality; i++) groupPrimeIndices[i] = (cardinality - 1 - i);
-            while (groupPrimeIndices[0] < multiplierGroup.primeCount) {
-                double combinationPairScoreSum = 0;
-                for (int iPrimeA = 1; iPrimeA < cardinality; iPrimeA++) {
-                    for (int iPrimeB = 0; iPrimeB < iPrimeA; iPrimeB++) {
-                        int iPairMapped = (int)mergeIndexPair(groupPrimeIndices[iPrimeA], groupPrimeIndices[iPrimeB]);
-                        combinationPairScoreSum += primeMultiplierPairRanking.scores[multiplierGroup.scoresIndexBase + iPairMapped];
-                    }
-                }
-                indexedScoreMultiplierPairEntries[iCombination] = indexedScoreMultiplierPairEntry { scoredInteger { (float)combinationPairScoreSum, multiplierGroup.multiplier }, iCombination * cardinality };
+
+        // Create thread pool and results vector
+        const int threadCount = std::thread::hardware_concurrency();
+        std::vector<std::thread> threads(threadCount);
+        std::vector<threadBestCombinations> threadResults(threadCount);
+        std::atomic<size_t> nextGroupIndex(0);
+
+        // Launch threads
+        for (int iThread = 0; iThread < threadCount; iThread++) {
+            threads[iThread] = std::thread([&, iThread]() {
+                std::vector<int> groupPrimeIndices(cardinality);
+                size_t processedCount = 0;
                 
-                for (int i = 0; i < cardinality; i++) {
-                    int prime = (int)primeMultiplierPairRanking.primesForMultiplierGroups[multiplierGroup.primesIndexBase + groupPrimeIndices[i]];
-                    double sumOfPairScores = 0;
-                    for (int iPrimeA = 1; iPrimeA < cardinality; iPrimeA++) {
-                        for (int iPrimeB = 0; iPrimeB < iPrimeA; iPrimeB++) {
-                            if (iPrimeA != i && iPrimeB != i) continue;
-                            int iPairMapped = (int)mergeIndexPair(groupPrimeIndices[iPrimeA], groupPrimeIndices[iPrimeB]);
-                            sumOfPairScores += primeMultiplierPairRanking.scores[multiplierGroup.scoresIndexBase + iPairMapped];
+                while (true) {
+                    // Get next group to process
+                    size_t iGroup = nextGroupIndex.fetch_add(1);
+                    if (iGroup >= primeMultiplierPairRanking.multiplierGroups.size()) break;
+                    
+                    multiplierGroup& multiplierGroup = primeMultiplierPairRanking.multiplierGroups[iGroup];
+                    if (multiplierGroup.primeCount < cardinality) continue;
+
+                    for (int i = 0; i < cardinality; i++) groupPrimeIndices[i] = (cardinality - 1 - i);
+                    while (groupPrimeIndices[0] < multiplierGroup.primeCount) {
+                        double combinationPairScoreSum = 0;
+                        for (int iPrimeA = 1; iPrimeA < cardinality; iPrimeA++) {
+                            for (int iPrimeB = 0; iPrimeB < iPrimeA; iPrimeB++) {
+                                int iPairMapped = (int)mergeIndexPair(groupPrimeIndices[iPrimeA], groupPrimeIndices[iPrimeB]);
+                                combinationPairScoreSum += primeMultiplierPairRanking.scores[multiplierGroup.scoresIndexBase + iPairMapped];
+                            }
+                        }
+
+                        // Store combination if it's among thread's best
+                        if (threadResults[iThread].combinations.size() < COMBINATIONS_TO_OUTPUT || 
+                            combinationPairScoreSum < threadResults[iThread].combinations[0].scoreMultiplierPair.score) {
+                            std::vector<uint> primesInCombination(cardinality);
+                            for (int i = 0; i < cardinality; i++) {
+                                primesInCombination[i] = primeMultiplierPairRanking.primesForMultiplierGroups[
+                                    multiplierGroup.primesIndexBase + groupPrimeIndices[i]];
+                            }
+
+                            indexedScoreMultiplierPairEntry entry{
+                                scoredInteger{ (float)combinationPairScoreSum, multiplierGroup.multiplier },
+                                processedCount
+                            };
+
+                            if (threadResults[iThread].combinations.size() < COMBINATIONS_TO_OUTPUT) {
+                                threadResults[iThread].combinations.push_back(entry);
+                                std::push_heap(threadResults[iThread].combinations.begin(), threadResults[iThread].combinations.end(),
+                                    [](const auto& a, const auto& b) { return a.scoreMultiplierPair.score < b.scoreMultiplierPair.score; });
+                            } else {
+                                std::pop_heap(threadResults[iThread].combinations.begin(), threadResults[iThread].combinations.end(),
+                                    [](const auto& a, const auto& b) { return a.scoreMultiplierPair.score < b.scoreMultiplierPair.score; });
+                                threadResults[iThread].combinations.back() = entry;
+                                std::push_heap(threadResults[iThread].combinations.begin(), threadResults[iThread].combinations.end(),
+                                    [](const auto& a, const auto& b) { return a.scoreMultiplierPair.score < b.scoreMultiplierPair.score; });
+                            }
+
+                            // Store the primes for this combination
+                            if (threadResults[iThread].primes.size() < COMBINATIONS_TO_OUTPUT * cardinality) {
+                                threadResults[iThread].primes.insert(threadResults[iThread].primes.end(), 
+                                    primesInCombination.begin(), primesInCombination.end());
+                            }
+                        }
+
+                        processedCount++;
+                        // if (processedCount % 100000000 == 0) {
+                        //     std::lock_guard<std::mutex> lock(printMutex);
+                        //     double percentage = (double)processedCount / (double)combinationCountTotal * 100.0;
+                        //     std::cout << "Thread " << iThread << " processed " << processedCount << 
+                        //         " combinations (" << percentage << "%)..." << std::endl;
+                        // }
+
+                        // Next indices
+                        int lastIndex = -1;
+                        for (int i = cardinality - 1;; i--) {
+                            groupPrimeIndices[i]++;
+                            if (i <= 0 || groupPrimeIndices[i] < groupPrimeIndices[i - 1]) break;
+                            else groupPrimeIndices[i] = lastIndex + 1;
+                            lastIndex = groupPrimeIndices[i];
                         }
                     }
-                    primeCombinations[iCombination * cardinality + i] = scoredInteger { (float)sumOfPairScores, prime };
+
+                    if (iGroup % 10000 == 0) {
+                        double percentage = (double)iGroup / (double)primeMultiplierPairRanking.multiplierGroups.size() * 100.0;
+                        std::cout << "Thread " << iThread << " processed group " << iGroup << 
+                            " (" << percentage << "%)..." << std::endl;
+                    }
                 }
-                
-                // Sort primes within a combination by best sum of pair scores, calculated above
-                std::sort(&primeCombinations[iCombination * cardinality], &primeCombinations[iCombination * cardinality + cardinality], [](const scoredInteger& a, const scoredInteger& b) { return a.score < b.score; });
-                
-                // Next indices
-                int lastIndex = -1;
-                for (int i = cardinality - 1;; i--) {
-                    groupPrimeIndices[i]++;
-                    
-                    if (i <= 0 || groupPrimeIndices[i] < groupPrimeIndices[i - 1]) break;
-                    else groupPrimeIndices[i] = lastIndex + 1;
-                    
-                    lastIndex = groupPrimeIndices[i];
-                }
-                iCombination++;
-            }
+            });
         }
-        assert(iCombination == combinationCountTotal);
-        
-        std::sort(indexedScoreMultiplierPairEntries.begin(), indexedScoreMultiplierPairEntries.end(), [](const indexedScoreMultiplierPairEntry& a, const indexedScoreMultiplierPairEntry& b) { return a.scoreMultiplierPair.score < b.scoreMultiplierPair.score; });
-        
-        sortedScoreMultiplierPairs.resize(indexedScoreMultiplierPairEntries.size());
-        sortedPrimeCombinations.resize(primeCombinations.size());
-        for (size_t iSortedEntry = 0; iSortedEntry < indexedScoreMultiplierPairEntries.size(); iSortedEntry++) {
-            indexedScoreMultiplierPairEntry& entry = indexedScoreMultiplierPairEntries[iSortedEntry];
-            sortedScoreMultiplierPairs[iSortedEntry] = entry.scoreMultiplierPair;
-            for (int i = 0; i < cardinality; i++) sortedPrimeCombinations[iSortedEntry * cardinality + i] =
-                primeCombinations[entry.combinationStartIndex + i].value; // TODO it would be cool to sort the primes *within* a combination by... either individual score or best sum of pair scores within the combination. Maybe it's best done in the previous step?
+
+        // Wait for all threads to complete
+        for (auto& thread : threads) {
+            thread.join();
         }
-        
-        assert(sortedScoreMultiplierPairs.size() == indexedScoreMultiplierPairEntries.size());
-        assert(sortedPrimeCombinations.size() == primeCombinations.size());
-        assert(sortedScoreMultiplierPairs.size() * cardinality == sortedPrimeCombinations.size());
-        
+
+        // Merge results from all threads
+        std::vector<indexedScoreMultiplierPairEntry> mergedCombinations;
+        for (const auto& threadResult : threadResults) {
+            mergedCombinations.insert(mergedCombinations.end(), 
+                threadResult.combinations.begin(), threadResult.combinations.end());
+        }
+
+        // Sort and keep best COMBINATIONS_TO_OUTPUT
+        std::sort(mergedCombinations.begin(), mergedCombinations.end(),
+            [](const auto& a, const auto& b) { return a.scoreMultiplierPair.score < b.scoreMultiplierPair.score; });
+        if (mergedCombinations.size() > COMBINATIONS_TO_OUTPUT) {
+            mergedCombinations.resize(COMBINATIONS_TO_OUTPUT);
+        }
+
+        // Extract final sorted results
+        sortedScoreMultiplierPairs.reserve(mergedCombinations.size());
+        for (const auto& entry : mergedCombinations) {
+            sortedScoreMultiplierPairs.push_back(entry.scoreMultiplierPair);
+        }
+
+        // Merge prime combinations in the same order
+        for (const auto& threadResult : threadResults) {
+            sortedPrimeCombinations.insert(sortedPrimeCombinations.end(),
+                threadResult.primes.begin(), threadResult.primes.end());
+        }
+        if (sortedPrimeCombinations.size() > COMBINATIONS_TO_OUTPUT * cardinality) {
+            sortedPrimeCombinations.resize(COMBINATIONS_TO_OUTPUT * cardinality);
+        }
+
+        // Save results
         std::ofstream outFile(filename, std::ios::binary);
         if (outFile.is_open()) {
             uint64_t size = (uint64_t)sortedScoreMultiplierPairs.size();
             outFile.write(reinterpret_cast<char*>(&size), sizeof(uint64_t));
-            outFile.write(reinterpret_cast<const char*>(sortedScoreMultiplierPairs.data()), sortedScoreMultiplierPairs.size() * sizeof(scoredInteger));
-            outFile.write(reinterpret_cast<const char*>(sortedPrimeCombinations.data()), sortedPrimeCombinations.size() * sizeof(uint));
+            outFile.write(reinterpret_cast<const char*>(sortedScoreMultiplierPairs.data()), 
+                sortedScoreMultiplierPairs.size() * sizeof(scoredInteger));
+            outFile.write(reinterpret_cast<const char*>(sortedPrimeCombinations.data()),
+                sortedPrimeCombinations.size() * sizeof(uint));
             outFile.close();
-            std::cout << "Wrote scored prime multiplier group data to file: " << filename << std::endl;
-        } else {
-            std::cout << "Error opening file for writing: " << filename << std::endl;
+            std::cout << "Wrote top " << COMBINATIONS_TO_OUTPUT << " combinations to file: " << filename << std::endl;
         }
     } else {
         std::ifstream inFile(filename, std::ios::binary);
         if (inFile.is_open()) {
             uint64_t size;
-            inFile.read(reinterpret_cast<char*>(&size), sizeof(size));
+            inFile.read(reinterpret_cast<char*>(&size), sizeof(uint64_t));
+            
             sortedScoreMultiplierPairs.resize(size);
             sortedPrimeCombinations.resize(size * cardinality);
             
-            inFile.read(reinterpret_cast<char*>(sortedScoreMultiplierPairs.data()), sortedScoreMultiplierPairs.size() * sizeof(scoredInteger));
-            inFile.read(reinterpret_cast<char*>(sortedPrimeCombinations.data()), sortedPrimeCombinations.size() * sizeof(uint));
+            inFile.read(reinterpret_cast<char*>(sortedScoreMultiplierPairs.data()), 
+                size * sizeof(scoredInteger));
+            inFile.read(reinterpret_cast<char*>(sortedPrimeCombinations.data()),
+                size * cardinality * sizeof(uint));
+                
             inFile.close();
-            std::cout << "Loaded " << size << " combination entr" << (size == 1 ? "y" : "ies") << " from file: " << filename << std::endl;
+            std::cout << "Loaded " << size << " combinations from file: " << filename << std::endl;
         } else {
             std::cout << "Error opening file for reading: " << filename << std::endl;
         }
@@ -1283,6 +1372,11 @@ int main()
     primeMultiplierPairRanking primeMultiplierPairRanking = rankPrimePairs(deviceProp, validPrimeMultiplierPairs);
     combinationScorecard combinationScorecard = getBestCombinations(primeMultiplierPairRanking, TARGET_PRIME_GROUP_SIZE);
     
+    std::cout << "Total combinations: " << combinationScorecard.sortedScoreMultiplierPairs.size() << std::endl;
+
+    // Find the smallest prime in all combinations
+    uint smallestPrime = std::numeric_limits<uint>::max();
+    
     for (size_t iEntry = 0; iEntry < combinationScorecard.sortedScoreMultiplierPairs.size(); iEntry++) {
         scoredInteger& scoreMultiplierPair = combinationScorecard.sortedScoreMultiplierPairs[iEntry];
         std::cout << std::uppercase << std::hex << std::setw(8) << std::setfill('0');
@@ -1290,10 +1384,16 @@ int main()
         std::cout << "Multiplier: 0x" << scoreMultiplierPair.value << "; Score: " << scoreMultiplierPair.score << std::endl;
         std::cout << "Primes:";
         for (int i = 0; i < TARGET_PRIME_GROUP_SIZE; i++) {
-            std::cout << " 0x" << combinationScorecard.sortedPrimeCombinations[iEntry * TARGET_PRIME_GROUP_SIZE + i];
+            uint currentPrime = combinationScorecard.sortedPrimeCombinations[iEntry * TARGET_PRIME_GROUP_SIZE + i];
+            std::cout << " 0x" << currentPrime;
+            if (currentPrime < smallestPrime) {
+                smallestPrime = currentPrime;
+            }
         }
         std::cout << std::endl;
     }
+
+    std::cout << "Smallest prime: 0x" << std::uppercase << std::hex << std::setw(8) << std::setfill('0') << smallestPrime << std::endl;
 
     return 0;
 }
@@ -1543,6 +1643,11 @@ void testRankPrimePairsKernel() {
         std::cout << testPrefix << "Scores correctly changed with change to single prime in group: " << scoresChangedCorrectly << " / " << pairChangeCountExpected << std::endl;
         std::cout << testPrefix << "Scores correctly left unchanged with change to single prime in group: " << scoresUnchangedCorrectly << " / " << (cumulativePairCount - pairChangeCountExpected) << std::endl;
     }
+
+    cudaFree(d_scores);
+    cudaFree(d_multiplierGroups);
+    cudaFree(d_primesForMultiplierGroups);
+    cudaFree(d_threadStartIndices);
 }
     
 void test() {
