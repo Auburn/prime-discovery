@@ -157,6 +157,215 @@ struct fourierSpectrumScorer {
     }
 };
 
+// Enhanced Fourier analyzer optimized for coherent noise generation
+// This analyzer evaluates additional properties important for natural-looking noise:
+// 1. Spectral falloff (natural noise has 1/f falloff)
+// 2. Anisotropy detection (directional bias - coherent noise should be isotropic)
+// 3. Phase coherence (random phases are better for noise)
+// 4. Gradient uniformity (for proper gradient distribution)
+struct enhancedFourierAnalyzer {
+    // Statistical accumulation variables (from original analyzer)
+    double spectralValueSum = 0;
+    double spectralValueSumOfSquares = 0;
+    
+    // For spectral falloff (natural noise has 1/f falloff)
+    double lowFreqEnergySum = 0;  // Lower 1/3 of spectrum
+    double midFreqEnergySum = 0;  // Middle 1/3 of spectrum
+    double highFreqEnergySum = 0; // Upper 1/3 of spectrum
+    
+    // For anisotropy detection (directional bias)
+    double horizontalEnergySum = 0;
+    double verticalEnergySum = 0;
+    double diagonalEnergySum = 0;
+    
+    // For phase coherence analysis
+    double cosPhaseSum = 0;
+    double sinPhaseSum = 0;
+    
+    // Frequency bin counters
+    int lowFreqCount = 0;
+    int midFreqCount = 0;
+    int highFreqCount = 0;
+    int horizontalCount = 0;
+    int verticalCount = 0;
+    int diagonalCount = 0;
+    int totalCount = 0;
+    
+    __host__ __device__ void accept(double real, double imag, int xFreq, int yFreq, int maxFreq) {
+        double spectralValue = real * real + imag * imag;
+        totalCount++;
+        
+        // Original metrics
+        spectralValueSum += spectralValue;
+        spectralValueSumOfSquares += spectralValue * spectralValue;
+        
+        // Calculate frequency magnitude
+        double freqMagnitude = sqrt((double)(xFreq*xFreq + yFreq*yFreq));
+        double freqNormalized = freqMagnitude / maxFreq;
+        
+        // Spectral falloff analysis (divide spectrum into 3 bands)
+        if (freqNormalized < 0.33) {
+            lowFreqEnergySum += spectralValue;
+            lowFreqCount++;
+        } else if (freqNormalized < 0.67) {
+            midFreqEnergySum += spectralValue;
+            midFreqCount++;
+        } else {
+            highFreqEnergySum += spectralValue;
+            highFreqCount++;
+        }
+        
+        // Anisotropy analysis (directional bias)
+        if (abs(xFreq) > 3 * abs(yFreq)) {
+            horizontalEnergySum += spectralValue;
+            horizontalCount++;
+        } else if (abs(yFreq) > 3 * abs(xFreq)) {
+            verticalEnergySum += spectralValue;
+            verticalCount++;
+        } else if (abs(xFreq) > 0.5 * abs(yFreq) && abs(yFreq) > 0.5 * abs(xFreq)) {
+            diagonalEnergySum += spectralValue;
+            diagonalCount++;
+        }
+        
+        // Phase coherence
+        if (spectralValue > 0) {
+            double phase = atan2(imag, real);
+            cosPhaseSum += cos(phase);
+            sinPhaseSum += sin(phase);
+        }
+    }
+    
+    // Simple accept method that works with the original code (no frequency information)
+    __host__ __device__ void accept(double real, double imag) {
+        double spectralValue = real * real + imag * imag;
+        
+        // Original metrics
+        spectralValueSum += spectralValue;
+        spectralValueSumOfSquares += spectralValue * spectralValue;
+        totalCount++;
+    }
+    
+    __host__ __device__ double computeBasicScore() {
+        // Original uniformity score (lower is better)
+        return spectralValueSumOfSquares / (spectralValueSum * spectralValueSum);
+    }
+    
+    __host__ __device__ double computeSpectralFalloff() {
+        // Ideal coherent noise has energy falloff from low to high frequencies
+        // We want low > mid > high energy density (adjusted for bin count)
+        double lowFreqDensity = lowFreqCount > 0 ? lowFreqEnergySum / lowFreqCount : 0;
+        double midFreqDensity = midFreqCount > 0 ? midFreqEnergySum / midFreqCount : 0;
+        double highFreqDensity = highFreqCount > 0 ? highFreqEnergySum / highFreqCount : 0;
+        
+        // Calculate falloff ratios (ideally around 2:1 between adjacent bands)
+        double lowMidRatio = midFreqDensity > 0 ? lowFreqDensity / midFreqDensity : 0;
+        double midHighRatio = highFreqDensity > 0 ? midFreqDensity / highFreqDensity : 0;
+        
+        // Penalize deviation from ideal 2:1 ratios
+        double falloffScore = fabs(lowMidRatio - 2.0) + fabs(midHighRatio - 2.0);
+        return falloffScore;
+    }
+    
+    __host__ __device__ double computeAnisotropyScore() {
+        // Calculate energy density in each direction
+        double horizDensity = horizontalCount > 0 ? horizontalEnergySum / horizontalCount : 0;
+        double vertDensity = verticalCount > 0 ? verticalEnergySum / verticalCount : 0;
+        double diagDensity = diagonalCount > 0 ? diagonalEnergySum / diagonalCount : 0;
+        
+        // Calculate variance between directions (lower is better - means more isotropic)
+        double meanDensity = (horizDensity + vertDensity + diagDensity) / 3.0;
+        double varianceDensity = 0;
+        
+        if (meanDensity > 0) {
+            double horizDev = horizDensity / meanDensity - 1.0;
+            double vertDev = vertDensity / meanDensity - 1.0;
+            double diagDev = diagDensity / meanDensity - 1.0;
+            
+            varianceDensity = (horizDev*horizDev + vertDev*vertDev + diagDev*diagDev) / 3.0;
+        }
+        
+        return varianceDensity;
+    }
+    
+    __host__ __device__ double computePhaseCoherenceScore() {
+        // Measure randomness of phases (higher is better for noise)
+        // This returns lower values for random phases (good for noise)
+        if (totalCount <= 1) return 0.0;
+        
+        double phaseCoherence = sqrt(cosPhaseSum*cosPhaseSum + sinPhaseSum*sinPhaseSum) / totalCount;
+        return phaseCoherence;
+    }
+    
+    __host__ __device__ double compute() {
+        // If we have frequency information, use the detailed metrics
+        if (lowFreqCount > 0 || horizontalCount > 0) {
+            double uniformityScore = computeBasicScore();
+            double falloffScore = computeSpectralFalloff();
+            double anisotropyScore = computeAnisotropyScore();
+            double phaseCoherenceScore = computePhaseCoherenceScore();
+            
+            // Combine scores with appropriate weights for coherent noise
+            // - We want uniform energy within each frequency band (low uniformityScore)
+            // - We want natural falloff between bands (low falloffScore)
+            // - We want isotropic properties (low anisotropyScore)
+            // - We want random phases (low phaseCoherenceScore)
+            
+            return uniformityScore + 
+                   0.5 * falloffScore + 
+                   2.0 * anisotropyScore + 
+                   3.0 * phaseCoherenceScore;
+        } else {
+            // Fall back to basic score if we don't have frequency information
+            return computeBasicScore();
+        }
+    }
+};
+
+
+// Enhanced gradient analyzer focused on index distribution for table lookups
+struct indexDistributionAnalyzer {
+    // Analysis for index distribution (e.g., for 16-entry lookup tables)
+    static const int INDEX_BINS = 16; // Assuming low 4 bits of hash used for lookup index
+    double indexBins[INDEX_BINS];
+    int totalHashes;
+
+    __host__ __device__ indexDistributionAnalyzer() {
+        for (int i = 0; i < INDEX_BINS; i++) {
+            indexBins[i] = 0;
+        }
+        totalHashes = 0;
+    }
+
+    __host__ __device__ void analyzeHash(int hash) {
+        // Extract the likely index bits from the hash
+        // Assuming the low 4 bits determine the index for a 16-entry lookup
+        int index = hash & (INDEX_BINS - 1); // Equivalent to hash % 16
+
+        // Increment the count for the corresponding bin
+        if (index >= 0 && index < INDEX_BINS) { // Basic bounds check
+           indexBins[index]++;
+        }
+        totalHashes++;
+    }
+
+    __host__ __device__ double computeUniformity() {
+        // Compute uniformity based on how evenly the indices are distributed
+        if (totalHashes == 0) return 0.0;
+
+        double idealCount = (double)totalHashes / INDEX_BINS;
+        double sumSquaredDev = 0;
+
+        for (int i = 0; i < INDEX_BINS; i++) {
+            double deviation = indexBins[i] - idealCount;
+            sumSquaredDev += deviation * deviation;
+        }
+
+        // Return a Chi-squared-like metric. Lower is better (more uniform).
+        // Avoid division by zero if idealCount is somehow zero.
+        return (idealCount > 1e-9) ? (sumSquaredDev / idealCount) : 0.0;
+    }
+};
+
 /*
  * Prime sieving
  */
@@ -334,21 +543,40 @@ __global__ void narrowPrimesKernel(int* d_primes, int primeCount, size_t batchSi
 		}
 		
 		// Compute the Discrete Fourier Transform over the X direction for all Y and bit positions.
-        fourierSpectrumScorer scorer;
+        enhancedFourierAnalyzer analyzer;
+        indexDistributionAnalyzer gradientAnalyzer;
+        
         for (int bitIndex = 0; bitIndex < BIT_RANGE; bitIndex++) {
             int bufferIndexWithB = bitIndex;
             for (int xBufferIndex = 0; xBufferIndex < HASH_RANGE_1D; xBufferIndex++) buffer_local_double[xBufferIndex] = buffer[bufferIndexWithB + xBufferIndex * BIT_RANGE];
             for (int xBufferIndex = HASH_RANGE_1D; xBufferIndex < HASH_RANGE_1D * 2; xBufferIndex++) buffer_local_double[xBufferIndex] = complex_type{ 0.0, 0.0 };
             FFT_XY().execute(&buffer_local_double[0]);
-            //for (int xBufferIndex = 0; xBufferIndex < HASH_RANGE_1D; xBufferIndex++) buffer[bufferIndexWithB + xBufferIndex * BIT_RANGE] = buffer_local_double[xBufferIndex];
-            // Use the values directly instead.
+            
             for (int xBufferIndex = 0; xBufferIndex < HASH_RANGE_1D; xBufferIndex++) {
                 complex_type& value = buffer_local_double[xBufferIndex];
-                scorer.accept(value.x, value.y);
+                
+                // Convert buffer indices to frequency values
+                int xFreq = xBufferIndex;
+                if (xFreq >= HASH_RANGE_1D / 2) xFreq -= HASH_RANGE_1D;
+                
+                // Since this is 1D analysis, y frequency is 0
+                analyzer.accept(value.x, value.y, xFreq, 0, HASH_RANGE_1D/2);
             }
         }
+        
+        // Analyze gradient distribution for this prime
+        for (int i = 0; i < 64; i++) {
+            int hash = prime * (i + 1);
+            hash ^= (hash >> 15);
+            gradientAnalyzer.analyzeHash(hash);
+        }
 		
-        double score = scorer.compute();
+        // Compute combined score with components for coherent noise quality
+        double spectralScore = analyzer.compute();
+        double gradientScore = gradientAnalyzer.computeUniformity();
+        
+        // Combine scores with weights adjusted for coherent noise quality
+        double score = 0.8 * spectralScore + 0.2 * gradientScore;
         
         // Update heap, one thread at a time
         // Note: heap too large for per-warp heap approach.
@@ -863,7 +1091,10 @@ __global__ void rankPrimePairsKernel(uint* d_primesForMultiplierGroups, multipli
 		}
 		
 		// Compute the Discrete Fourier Transform over the X direction for all Y and bit positions.
-        fourierSpectrumScorer scorer;
+        // Replace with enhanced Fourier analyzer for better coherent noise properties
+        enhancedFourierAnalyzer analyzer;
+        indexDistributionAnalyzer gradientAnalyzer;
+        
 		for (int yBufferIndex = 0; yBufferIndex < HASH_RANGE_2D; yBufferIndex++) {
 			int bufferIndexWithY = yBufferIndex * BIT_RANGE;
 			for (int bitIndex = 0; bitIndex < BIT_RANGE; bitIndex++) {
@@ -871,21 +1102,49 @@ __global__ void rankPrimePairsKernel(uint* d_primesForMultiplierGroups, multipli
 				for (int xBufferIndex = 0; xBufferIndex < HASH_RANGE_2D; xBufferIndex++) buffer_local_double[xBufferIndex] = buffer[bufferIndexWithYB + xBufferIndex * (HASH_RANGE_2D * BIT_RANGE)];
                 for (int xBufferIndex = HASH_RANGE_2D; xBufferIndex < HASH_RANGE_2D * 2; xBufferIndex++) buffer_local_double[xBufferIndex] = complex_type{ 0.0, 0.0 };
 				FFT_XY().execute(&buffer_local_double[0]);
-                // for (int xBufferIndex = 0; xBufferIndex < HASH_RANGE_2D; xBufferIndex++) buffer[bufferIndexWithYB + xBufferIndex * (HASH_RANGE_2D * BIT_RANGE)] = buffer_local_double[xBufferIndex];
-                // Use the values directly instead.
+                
 				for (int xBufferIndex = 0; xBufferIndex < HASH_RANGE_2D; xBufferIndex++) {
                     complex_type& value = buffer_local_double[xBufferIndex];
-                    scorer.accept(value.x, value.y);
+                    
+                    // Convert buffer indices to frequency values
+                    // For FFT, frequencies are in range [-N/2, N/2-1] after reordering
+                    int xFreq = xBufferIndex;
+                    if (xFreq >= HASH_RANGE_2D / 2) xFreq -= HASH_RANGE_2D;
+                    
+                    int yFreq = yBufferIndex;
+                    if (yFreq >= HASH_RANGE_2D / 2) yFreq -= HASH_RANGE_2D;
+                    
+                    // Pass frequency information for better analysis
+                    analyzer.accept(value.x, value.y, xFreq, yFreq, HASH_RANGE_2D/2);
                 }
 			}
 		}
+        
+        // Also analyze gradient distribution by simulating how these primes would generate gradients
+        int hashBase = primeA * primeB * multiplierGroupCurrent.multiplier;
+        for (int i = 0; i < 64; i++) {  // Sample some hash values
+            int hash = hashBase + i;
+            hash ^= (hash >> 15);
+            gradientAnalyzer.analyzeHash(hash);
+        }
         
         if (batchSizePrintTotal > 0 && threadIdx.x == 0 && threadIdx.y == 0 && blockIdx.x == 0) {
             size_t progress = iWithinBatch + batchSizePrintStart + 1;
             printf("[Thread 0] Progress: %llu / %llu (%.4f%)\n", progress, batchSizePrintTotal, progress * 100.0 / batchSizePrintTotal);
         }
 		
-        double score = scorer.compute();
+        // Compute combined score with components for coherent noise quality
+        double spectralScore = analyzer.compute();
+        double gradientScore = gradientAnalyzer.computeUniformity();
+        
+        // Combine scores - spectral properties (80%) and gradient distribution (20%)
+        double score = 0.8 * spectralScore + 0.2 * gradientScore;
+        
+        // Debugging info for first few calculations (if in thread 0)
+        if (iWithinBatch < 5 && threadIdx.x == 0 && threadIdx.y == 0 && blockIdx.x == 0) {
+            printf("Debug [%llu] - Spectral: %.4f, Gradient: %.4f, Combined: %.4f\n", 
+                   iWithinBatch, spectralScore, gradientScore, score);
+        }
         
         d_scores[iScoresStart + iWithinBatch] = (float)score;
                         
@@ -1353,6 +1612,81 @@ combinationScorecard getBestCombinations(primeMultiplierPairRanking& primeMultip
 void test();
 #endif
 
+// Visualization helper function to evaluate coherent noise quality
+void visualizeNoiseAndSpectrum(const std::vector<scoredInteger>& bestScoreMultiplierPairs, 
+                              const std::vector<uint>& bestPrimeCombinations, 
+                              int cardinality) {
+    // Create a "visualization" directory if it doesn't exist
+    std::string dirName = "visualization";
+    if (!std::filesystem::exists(dirName)) {
+        std::filesystem::create_directory(dirName);
+    }
+    
+    // Output information about top combinations
+    std::ofstream infoFile(dirName + "/combinations_info.txt");
+    if (!infoFile) {
+        std::cout << "Could not open info file for writing" << std::endl;
+        return;
+    }
+    
+    // Write information about the top combinations
+    infoFile << "Top " << std::min(10, (int)bestScoreMultiplierPairs.size()) << " prime combinations for coherent noise:" << std::endl;
+    
+    for (int i = 0; i < std::min(10, (int)bestScoreMultiplierPairs.size()); i++) {
+        const auto& entry = bestScoreMultiplierPairs[i];
+        infoFile << "Combination " << i + 1 << ":" << std::endl;
+        infoFile << "  Score: " << entry.score << std::endl;
+        infoFile << "  Multiplier: 0x" << std::hex << entry.value << std::dec << std::endl;
+        infoFile << "  Primes: ";
+        
+        for (int j = 0; j < cardinality; j++) {
+            uint prime = bestPrimeCombinations[i * cardinality + j];
+            infoFile << "0x" << std::hex << prime << std::dec;
+            if (j < cardinality - 1) infoFile << ", ";
+        }
+        infoFile << std::endl;
+        
+        // Generate a simple ASCII visualization of noise characteristics
+        infoFile << std::endl << "Noise Pattern Preview (ASCII):" << std::endl;
+        const int width = 40;
+        const int height = 20;
+        
+        for (int y = 0; y < height; y++) {
+            for (int x = 0; x < width; x++) {
+                int hash = 0;
+                uint multiplier = entry.value;
+                
+                // Use all primes to generate hash
+                for (int j = 0; j < cardinality; j++) {
+                    uint prime = bestPrimeCombinations[i * cardinality + j];
+                    hash ^= (int)(x * prime) ^ (int)(y * (prime >> 8));
+                }
+                
+                hash *= multiplier;
+                hash ^= (hash >> 15);
+                
+                // Convert hash to a simple gradient value
+                float noiseVal = (hash & 0xFFFF) / (float)0xFFFF;
+                
+                // Map to ASCII character based on value
+                const char* gradientChars = " .:-=+*#%@";
+                int charIndex = (int)(noiseVal * 9);
+                infoFile << gradientChars[charIndex];
+            }
+            infoFile << std::endl;
+        }
+        
+        infoFile << std::endl << "-----------------------------------------------------" << std::endl << std::endl;
+    }
+    
+    infoFile.close();
+    std::cout << "Wrote visualization data to " << dirName << "/combinations_info.txt" << std::endl;
+    
+    // For actual applications, you would want to output proper image files 
+    // with noise fields and FFT visualizations, but that's beyond the scope
+    // of this simple preview implementation
+}
+
 int main()
 {
     int cudeDev = 0;
@@ -1371,11 +1705,14 @@ int main()
     std::vector<pair<uint>> validPrimeMultiplierPairs = getValidPrimeMultiplierPairs(deviceProp, primes);
     primeMultiplierPairRanking primeMultiplierPairRanking = rankPrimePairs(deviceProp, validPrimeMultiplierPairs);
     combinationScorecard combinationScorecard = getBestCombinations(primeMultiplierPairRanking, TARGET_PRIME_GROUP_SIZE);
-    
     std::cout << "Total combinations: " << combinationScorecard.sortedScoreMultiplierPairs.size() << std::endl;
 
     // Find the smallest prime in all combinations
     uint smallestPrime = std::numeric_limits<uint>::max();
+    
+    // Open a file to write the results
+    std::ofstream resultsFile("results.txt");
+    resultsFile << "Total combinations: " << combinationScorecard.sortedScoreMultiplierPairs.size() << std::endl;
     
     for (size_t iEntry = 0; iEntry < combinationScorecard.sortedScoreMultiplierPairs.size(); iEntry++) {
         scoredInteger& scoreMultiplierPair = combinationScorecard.sortedScoreMultiplierPairs[iEntry];
@@ -1383,17 +1720,33 @@ int main()
         std::cout << std::endl;
         std::cout << "Multiplier: 0x" << scoreMultiplierPair.value << "; Score: " << scoreMultiplierPair.score << std::endl;
         std::cout << "Primes:";
+        
+        // Also write to file
+        resultsFile << std::uppercase << std::hex << std::setw(8) << std::setfill('0');
+        resultsFile << std::endl;
+        resultsFile << "Multiplier: 0x" << scoreMultiplierPair.value << "; Score: " << scoreMultiplierPair.score << std::endl;
+        resultsFile << "Primes:";
+        
         for (int i = 0; i < TARGET_PRIME_GROUP_SIZE; i++) {
             uint currentPrime = combinationScorecard.sortedPrimeCombinations[iEntry * TARGET_PRIME_GROUP_SIZE + i];
             std::cout << " 0x" << currentPrime;
+            resultsFile << " 0x" << currentPrime;
             if (currentPrime < smallestPrime) {
                 smallestPrime = currentPrime;
             }
         }
         std::cout << std::endl;
+        resultsFile << std::endl;
     }
 
     std::cout << "Smallest prime: 0x" << std::uppercase << std::hex << std::setw(8) << std::setfill('0') << smallestPrime << std::endl;
+    resultsFile << "Smallest prime: 0x" << std::uppercase << std::hex << std::setw(8) << std::setfill('0') << smallestPrime << std::endl;
+    
+    resultsFile.close();
+    std::cout << "Results written to results.txt" << std::endl;
+
+    // Visualize the top combinations
+    //visualizeNoiseAndSpectrum(combinationScorecard.sortedScoreMultiplierPairs, combinationScorecard.sortedPrimeCombinations, TARGET_PRIME_GROUP_SIZE);
 
     return 0;
 }
