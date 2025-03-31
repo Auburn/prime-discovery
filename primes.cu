@@ -133,7 +133,7 @@ __device__ pair<int> extractIndexPair_fullPrecision(int64_t pairIndex) {
     return pair<int> { indexA, indexB };
 }
 
-__host__ __device__ int64_t mergeIndexPair(int indexA, int indexB) {
+inline int64_t mergeIndexPair(int indexA, int indexB) {
     return (int64_t)indexA * (indexA - 1) / 2 + indexB;
 }
 
