@@ -897,6 +897,7 @@ std::vector<pair<uint>> getValidPrimeMultiplierPairs(cudaDeviceProp& deviceProp,
         cudaMalloc((void**)&d_validPairs, VALID_PAIR_COUNT_BUFFER_SIZE * sizeof(pair<int>));
         
         float time;
+        int64_t progress;
         cudaEvent_t start, stop;
         cudaEventCreate(&start);
         cudaEventCreate(&stop);
@@ -933,20 +934,20 @@ std::vector<pair<uint>> getValidPrimeMultiplierPairs(cudaDeviceProp& deviceProp,
             assert(vars.validPairCount <= VALID_PAIR_COUNT_BUFFER_SIZE);
             cudaMemcpy(validPairs.data() + validPairsOldSize, d_validPairs, vars.validPairCount * sizeof(pair<uint>), cudaMemcpyDeviceToHost);
             
-            cudaMemcpy(threadIndicesWithinBatch.data(), d_threadIndicesWithinBatch, threadCount * sizeof(int), cudaMemcpyDeviceToHost);
-            int64_t progress = 0;
+            cudaMemcpy(threadIndicesWithinBatch.data(), d_threadIndicesWithinBatch, threadCount * sizeof(int64_t), cudaMemcpyDeviceToHost); // Note: Use int64_t if progress > 2^31
+            progress = 0;
             for (int i = 0; i < threadCount; i++) {
                 progress += threadIndicesWithinBatch[i];
             }
             double progressPercent = progress * 100.0 / pairCount;
             std::cout << "Pairs found so far: " << validPairs.size() << "; Progress: " << progress << " / " << pairCount << " (" << progressPercent << "%)" << std::endl;
             
-            if (vars.stoppedShort != (progress != pairCount)) {
+            if (vars.stoppedShort != (progress < pairCount)) {
                 std::cout << "Warning: `vars.stoppedShort` was " << std::to_string(vars.stoppedShort) << " but `progress` (" << std::to_string(progress) << ") " <<
-                    (progress != pairCount ? "!" : "=") << "= `pairCount` (" << std::to_string(pairCount) << ")" << std::endl;
+                    (progress < pairCount ? "!" : "=") << "= `pairCount` (" << std::to_string(pairCount) << ")" << std::endl;
             }
             
-        } while (vars.stoppedShort);
+        } while (progress < pairCount); // Keep looping until all pairs are processed
         
         std::cout << "Finished pair discovery." << std::endl;
         
