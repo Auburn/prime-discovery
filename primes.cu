@@ -29,13 +29,22 @@
 #include <thrust/binary_search.h>
 #include <thrust/device_ptr.h>
 
+// Include the necessary headers for file I/O and memory mapping
+#include <fcntl.h>      // For open
+#include <unistd.h>     // For close, ftruncate, pwrite
+#include <sys/mman.h>   // For mmap, munmap
+#include <sys/stat.h>   // For fstat
+#include <errno.h>      // For error handling with errno
+
+#include "indicators.hpp"
+
 using namespace cufftdx;
 
 #define WARP_SIZE 32
 #define PRIME_LOWER_BOUND (1 << 29)
-#define VALID_PAIR_COUNT_BUFFER_SIZE (1 << 25)
-#define PAIR_SCORE_BUFFER_SIZE (1 << 30)
-#define MAX_SCORED_PRIME_COUNT (1 << 19)
+#define VALID_PAIR_COUNT_BUFFER_SIZE (1 << 27)
+#define PAIR_SCORE_BUFFER_SIZE ((size_t)1 << 32)
+#define MAX_SCORED_PRIME_COUNT (1 << 20)
 #define EXECUTE_TEST_RUN false
 
 #define BIT_RANGE 31
@@ -1021,7 +1030,7 @@ struct batchStartIndex {
 struct primeMultiplierPairRanking {
     std::vector<multiplierGroup> multiplierGroups;
     std::vector<uint> primesForMultiplierGroups;
-    std::vector<float> scores;
+    std::string scoresFilePath; // Path to the scores file instead of storing them in memory
 };
 
 __global__ void rankPrimePairsKernel(uint* d_primesForMultiplierGroups, multiplierGroup* d_multiplierGroups, int multiplierGroupCount, batchStartIndex* d_threadStartIndices, size_t batchSize, size_t batchSizePrintStart, size_t batchSizePrintTotal, float* d_scores, int scoreLimit) {
@@ -1212,7 +1221,7 @@ size_t populateThreadStartIndices(std::vector<batchStartIndex>& threadStartIndic
 
 template<bool IsTest = false>
 void runRankPrimePairsKernel(size_t pairScoreBufferSize, int cumulativePairCount, std::vector<batchStartIndex>& threadStartIndices, batchStartIndex* d_threadStartIndices, std::vector<multiplierGroup>& multiplierGroups,
-        multiplierGroup* d_multiplierGroups, uint* d_primesForMultiplierGroups, std::vector<float>& scores, float* d_scores, int blockCount, int warpsPerBlock, size_t sharedMemorySizePerBlock) {
+        multiplierGroup* d_multiplierGroups, uint* d_primesForMultiplierGroups, int fd_scores, float* d_scores, int blockCount, int warpsPerBlock, size_t sharedMemorySizePerBlock) {
     int threadCount = threadStartIndices.size();
     size_t iMultiplierGroup = 0;
     size_t batchSizePrintStart = 0;
@@ -1224,6 +1233,10 @@ void runRankPrimePairsKernel(size_t pairScoreBufferSize, int cumulativePairCount
             cumulativePairCountProgress += cumulativePairCountThisIteration;
         }
     }
+    
+    // Host buffer for scores
+    std::vector<float> host_scores_buffer;
+    
     for (size_t cumulativePairCountProgress = 0; cumulativePairCountProgress < cumulativePairCount; ) {
         size_t cumulativePairCountThisIteration = std::min(cumulativePairCount - cumulativePairCountProgress, pairScoreBufferSize);
         size_t batchSizeThisIteration = populateThreadStartIndices(threadStartIndices, iMultiplierGroup, multiplierGroups, cumulativePairCountThisIteration, cumulativePairCountProgress);
@@ -1252,8 +1265,24 @@ void runRankPrimePairsKernel(size_t pairScoreBufferSize, int cumulativePairCount
         cudaEventElapsedTime(&time, start, stop);
         if (!IsTest) printf("Completed. Kernel elapsed time: %.3f s \n", time / 1000);
         
-        // When processing chunks, we need to copy to the correct offset in the scores array
-        cudaMemcpy(scores.data() + cumulativePairCountProgress, d_scores, cumulativePairCountThisIteration * sizeof(float), cudaMemcpyDeviceToHost);
+        // Resize the host buffer for this chunk
+        host_scores_buffer.resize(cumulativePairCountThisIteration);
+        
+        // Copy results from GPU to host buffer
+        cudaMemcpy(host_scores_buffer.data(), d_scores, cumulativePairCountThisIteration * sizeof(float), cudaMemcpyDeviceToHost);
+        
+        // Write directly to file with offset
+        ssize_t bytes_written = pwrite(fd_scores, host_scores_buffer.data(), cumulativePairCountThisIteration * sizeof(float), 
+                                cumulativePairCountProgress * sizeof(float));
+        
+        if (bytes_written != cumulativePairCountThisIteration * sizeof(float)) {
+            std::cerr << "Error writing to scores file: expected to write " 
+                      << cumulativePairCountThisIteration * sizeof(float) 
+                      << " bytes, but wrote " << bytes_written << " bytes" << std::endl;
+            if (bytes_written == -1) {
+                std::cerr << "Error: " << strerror(errno) << std::endl;
+            }
+        }
         
         cumulativePairCountProgress += cumulativePairCountThisIteration;
         batchSizePrintStart += batchSizeThisIteration;
@@ -1264,7 +1293,10 @@ primeMultiplierPairRanking rankPrimePairs(cudaDeviceProp& deviceProp, std::vecto
     
     std::vector<multiplierGroup> multiplierGroups;
     std::vector<uint> primesForMultiplierGroups;
-    std::vector<float> scores;
+    std::string scoresFilePath = "/mnt/ext/primeScores_" + std::to_string(primeMultiplierPairs.size()) + "_" + 
+                                  std::to_string(MAX_SCORED_PRIME_COUNT) + "_" + 
+                                  std::to_string(PRIME_LOWER_BOUND) + "_" + 
+                                  std::to_string(HASH_RANGE_1D) + ".bin";
     
     const std::string filename = "primeMultiplierPairRanking_" + std::to_string(primeMultiplierPairs.size()) + "_" + std::to_string(MAX_SCORED_PRIME_COUNT) + "_" + std::to_string(PRIME_LOWER_BOUND) + "_" + std::to_string(HASH_RANGE_1D) + ".bin";
     std::vector<uint> primesNarrowed;
@@ -1299,7 +1331,7 @@ primeMultiplierPairRanking rankPrimePairs(cudaDeviceProp& deviceProp, std::vecto
         }
     
         if (multiplierGroups.size() == 0) {
-            return { multiplierGroups, primesForMultiplierGroups, scores };
+            return { multiplierGroups, primesForMultiplierGroups, scoresFilePath };
         }
 
         int blockCount = 0;
@@ -1336,10 +1368,30 @@ primeMultiplierPairRanking rankPrimePairs(cudaDeviceProp& deviceProp, std::vecto
         cudaMalloc((void**)&d_multiplierGroups, groupsSize);
         cudaMemcpy(d_multiplierGroups, multiplierGroups.data(), groupsSize, cudaMemcpyHostToDevice);
         
-        scores.resize(cumulativePairCount);
+        // Create and open the scores file
+        int fd_scores = open(scoresFilePath.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
+        if (fd_scores == -1) {
+            std::cerr << "Failed to open scores file: " << strerror(errno) << std::endl;
+            // Cleanup and return what we have so far
+            cudaFree(d_multiplierGroups);
+            cudaFree(d_primesForMultiplierGroups);
+            return { multiplierGroups, primesForMultiplierGroups, scoresFilePath };
+        }
+        
+        // Resize the file to hold all scores
+        size_t total_file_size = cumulativePairCount * sizeof(float);
+        std::cout << "Pre-allocating " << (total_file_size / (1024.0 * 1024.0)) << " MB for scores file" << std::endl;
+        if (ftruncate(fd_scores, total_file_size) == -1) {
+            std::cerr << "Failed to resize scores file: " << strerror(errno) << std::endl;
+            close(fd_scores);
+            cudaFree(d_multiplierGroups);
+            cudaFree(d_primesForMultiplierGroups);
+            return { multiplierGroups, primesForMultiplierGroups, scoresFilePath };
+        }
+        
         float* d_scores;
         size_t scoresSize = std::min(cumulativePairCount, (size_t)PAIR_SCORE_BUFFER_SIZE) * sizeof(float);
-        std::cout << "Allocating " << (scoresSize / (1024.0 * 1024.0)) << " MB for scores array" << std::endl;
+        std::cout << "Allocating " << (scoresSize / (1024.0 * 1024.0)) << " MB for GPU scores buffer" << std::endl;
         cudaMalloc((void**)&d_scores, scoresSize);
         
         std::vector<batchStartIndex> threadStartIndices(threadCount);
@@ -1349,22 +1401,28 @@ primeMultiplierPairRanking rankPrimePairs(cudaDeviceProp& deviceProp, std::vecto
         cudaMalloc((void**)&d_threadStartIndices, indicesSize);
         
         runRankPrimePairsKernel(PAIR_SCORE_BUFFER_SIZE, cumulativePairCount, threadStartIndices, d_threadStartIndices, multiplierGroups, d_multiplierGroups,
-            d_primesForMultiplierGroups, scores, d_scores, blockCount, warpsPerBlock, sharedMemorySizePerBlock);
+            d_primesForMultiplierGroups, fd_scores, d_scores, blockCount, warpsPerBlock, sharedMemorySizePerBlock);
         
+        // Close the scores file
+        close(fd_scores);
+        
+        // Free GPU memory
         cudaFree(d_scores);
         cudaFree(d_multiplierGroups);
         cudaFree(d_primesForMultiplierGroups);
         cudaFree(d_threadStartIndices);
 
+        // Save metadata (multiplierGroups and primesForMultiplierGroups) to a separate file
         std::ofstream outFile(filename, std::ios::binary);
         if (outFile.is_open()) {
-            uint64_t sizes[] { multiplierGroups.size(), primesForMultiplierGroups.size(), scores.size() };
+            uint64_t sizes[] { multiplierGroups.size(), primesForMultiplierGroups.size(), cumulativePairCount };
             outFile.write(reinterpret_cast<char*>(&sizes), sizeof(sizes));
             outFile.write(reinterpret_cast<const char*>(multiplierGroups.data()), multiplierGroups.size() * sizeof(multiplierGroup));
             outFile.write(reinterpret_cast<const char*>(primesForMultiplierGroups.data()), primesForMultiplierGroups.size() * sizeof(uint));
-            outFile.write(reinterpret_cast<const char*>(scores.data()), scores.size() * sizeof(float));
+            outFile.write(reinterpret_cast<const char*>(scoresFilePath.c_str()), scoresFilePath.size() + 1); // +1 for null terminator
             outFile.close();
-            std::cout << "Wrote scored prime multiplier group data to file: " << filename << std::endl;
+            std::cout << "Wrote scored prime multiplier group metadata to file: " << filename << std::endl;
+            std::cout << "Scores written to file: " << scoresFilePath << std::endl;
         } else {
             std::cout << "Error opening file for writing: " << filename << std::endl;
         }
@@ -1375,21 +1433,25 @@ primeMultiplierPairRanking rankPrimePairs(cudaDeviceProp& deviceProp, std::vecto
             inFile.read(reinterpret_cast<char*>(&sizes), sizeof(sizes));
             multiplierGroups.resize(sizes[0]);
             primesForMultiplierGroups.resize(sizes[1]);
-            scores.resize(sizes[2]);
             
             inFile.read(reinterpret_cast<char*>(multiplierGroups.data()), multiplierGroups.size() * sizeof(multiplierGroup));
             inFile.read(reinterpret_cast<char*>(primesForMultiplierGroups.data()), primesForMultiplierGroups.size() * sizeof(uint));
-            inFile.read(reinterpret_cast<char*>(scores.data()), scores.size() * sizeof(float));
+            
+            // Read the scores file path
+            char buffer[1024];
+            inFile.read(buffer, sizeof(buffer));
+            scoresFilePath = std::string(buffer);
+            
             inFile.close();
             std::cout << "Loaded " << multiplierGroups.size() << " multiplier group" << (multiplierGroups.size() == 1 ? "" : "s");
             std::cout << ", " << primesForMultiplierGroups.size() << " corresponding prime" << (primesForMultiplierGroups.size() == 1 ? "" : "s");
-            std::cout << ", and " << scores.size() << " corresponding score" << (scores.size() == 1 ? "" : "s") << " from file: " << filename << std::endl;
+            std::cout << ", and scores file path: " << scoresFilePath << " from file: " << filename << std::endl;
         } else {
             std::cout << "Error opening file for reading: " << filename << std::endl;
         }
     }
     
-    return { multiplierGroups, primesForMultiplierGroups, scores };
+    return { multiplierGroups, primesForMultiplierGroups, scoresFilePath };
 }
 
 /*
@@ -1432,7 +1494,6 @@ combinationScorecard getBestCombinations(primeMultiplierPairRanking& primeMultip
     const std::string filename = "finalCombinations_" + std::to_string(cardinality) + "_" + std::to_string(COMBINATIONS_TO_OUTPUT) + "_" + 
         std::to_string(primeMultiplierPairRanking.multiplierGroups.size()) + "_" +
         std::to_string(primeMultiplierPairRanking.primesForMultiplierGroups.size()) + "_" + 
-        std::to_string(primeMultiplierPairRanking.scores.size()) + "_" +
         std::to_string(HASH_RANGE_1D) + ".bin";
     
     if (!fileExists(filename)) {       
@@ -1445,6 +1506,40 @@ combinationScorecard getBestCombinations(primeMultiplierPairRanking& primeMultip
         
         std::cout << "Total combinations: " << std::to_string(combinationCountTotal) << " (cardinality: " << cardinality << ")" << std::endl;
 
+        // Open the scores file for memory mapping
+        int fd_scores = open(primeMultiplierPairRanking.scoresFilePath.c_str(), O_RDONLY);
+        if (fd_scores == -1) {
+            std::cerr << "Failed to open scores file for reading: " << strerror(errno) << std::endl;
+            return { sortedScoreMultiplierPairs, sortedPrimeCombinations };
+        }
+        
+        // Get the file size
+        struct stat sb;
+        if (fstat(fd_scores, &sb) == -1) {
+            std::cerr << "Failed to get scores file size: " << strerror(errno) << std::endl;
+            close(fd_scores);
+            return { sortedScoreMultiplierPairs, sortedPrimeCombinations };
+        }
+        
+        // Map the file into memory for efficient random access
+        float* mapped_scores_ptr = (float*)mmap(NULL, sb.st_size, PROT_READ, MAP_PRIVATE, fd_scores, 0);
+        if (mapped_scores_ptr == MAP_FAILED) {
+            std::cerr << "Failed to memory map scores file: " << strerror(errno) << std::endl;
+            close(fd_scores);
+            return { sortedScoreMultiplierPairs, sortedPrimeCombinations };
+        }
+        
+        std::cout << "Successfully memory-mapped scores file of size " << (sb.st_size / (1024.0 * 1024.0)) << " MB" << std::endl;
+
+        indicators::show_console_cursor(false);
+        indicators::BlockProgressBar bar{
+            indicators::option::BarWidth{80},
+            indicators::option::PostfixText{"Get Best Combinations"},
+            indicators::option::ShowElapsedTime{true},
+            indicators::option::ShowRemainingTime{true},
+            indicators::option::MaxProgress{primeMultiplierPairRanking.multiplierGroups.size()}
+        };
+
         // Create thread pool and results vector
         const int threadCount = std::thread::hardware_concurrency();
         std::vector<std::thread> threads(threadCount);
@@ -1453,7 +1548,7 @@ combinationScorecard getBestCombinations(primeMultiplierPairRanking& primeMultip
 
         // Launch threads
         for (int iThread = 0; iThread < threadCount; iThread++) {
-            threads[iThread] = std::thread([&, iThread]() {
+            threads[iThread] = std::thread([&, iThread, mapped_scores_ptr]() {
                 std::vector<int> groupPrimeIndices(cardinality);
                 size_t processedCount = 0;
                 
@@ -1471,7 +1566,8 @@ combinationScorecard getBestCombinations(primeMultiplierPairRanking& primeMultip
                         for (int iPrimeA = 1; iPrimeA < cardinality; iPrimeA++) {
                             for (int iPrimeB = 0; iPrimeB < iPrimeA; iPrimeB++) {
                                 int iPairMapped = (int)mergeIndexPair(groupPrimeIndices[iPrimeA], groupPrimeIndices[iPrimeB]);
-                                combinationPairScoreSum += primeMultiplierPairRanking.scores[multiplierGroup.scoresIndexBase + iPairMapped];
+                                // Access scores from the memory-mapped file instead of vector
+                                combinationPairScoreSum += mapped_scores_ptr[multiplierGroup.scoresIndexBase + iPairMapped];
                             }
                         }
 
@@ -1526,10 +1622,8 @@ combinationScorecard getBestCombinations(primeMultiplierPairRanking& primeMultip
                         }
                     }
 
-                    if (iGroup % 10000 == 0) {
-                        double percentage = (double)iGroup / (double)primeMultiplierPairRanking.multiplierGroups.size() * 100.0;
-                        std::cout << "Thread " << iThread << " processed group " << iGroup << 
-                            " (" << percentage << "%)..." << std::endl;
+                    if (iGroup % 1000 == 0) {
+                        bar.set_progress(iGroup);
                     }
                 }
             });
@@ -1539,6 +1633,18 @@ combinationScorecard getBestCombinations(primeMultiplierPairRanking& primeMultip
         for (auto& thread : threads) {
             thread.join();
         }
+
+        indicators::show_console_cursor(true);
+
+        std::cout << "Merging threads' results..." << std::endl;
+        
+        // Unmap the file when done
+        if (munmap(mapped_scores_ptr, sb.st_size) == -1) {
+            std::cerr << "Failed to unmap scores file: " << strerror(errno) << std::endl;
+        }
+        
+        // Close the file descriptor
+        close(fd_scores);
 
         // Merge results from all threads
         std::vector<indexedScoreMultiplierPairEntry> mergedCombinations;
