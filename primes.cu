@@ -1293,7 +1293,7 @@ primeMultiplierPairRanking rankPrimePairs(cudaDeviceProp& deviceProp, std::vecto
     
     std::vector<multiplierGroup> multiplierGroups;
     std::vector<uint> primesForMultiplierGroups;
-    std::string scoresFilePath = "/mnt/ext/primeScores_" + std::to_string(primeMultiplierPairs.size()) + "_" + 
+    std::string scoresFilePath = "primeScores_" + std::to_string(primeMultiplierPairs.size()) + "_" + 
                                   std::to_string(MAX_SCORED_PRIME_COUNT) + "_" + 
                                   std::to_string(PRIME_LOWER_BOUND) + "_" + 
                                   std::to_string(HASH_RANGE_1D) + ".bin";
@@ -1440,7 +1440,7 @@ primeMultiplierPairRanking rankPrimePairs(cudaDeviceProp& deviceProp, std::vecto
             // Read the scores file path
             char buffer[1024];
             inFile.read(buffer, sizeof(buffer));
-            scoresFilePath = std::string(buffer);
+            //scoresFilePath = std::string(buffer);
             
             inFile.close();
             std::cout << "Loaded " << multiplierGroups.size() << " multiplier group" << (multiplierGroups.size() == 1 ? "" : "s");
@@ -1487,6 +1487,19 @@ struct threadBestCombinations {
     std::vector<uint> primes;
 };
 
+struct candidateCombination {
+    float score;
+    int multiplier;
+    std::vector<uint> primes;
+    
+    // Default constructor
+    candidateCombination() : score(0.0f), multiplier(0), primes() {}
+    
+    // Parameterized constructor
+    candidateCombination(float s, int m, const std::vector<uint>& p) 
+        : score(s), multiplier(m), primes(p) {}
+};
+
 combinationScorecard getBestCombinations(primeMultiplierPairRanking& primeMultiplierPairRanking, int cardinality) {
     std::vector<scoredInteger> sortedScoreMultiplierPairs;
     std::vector<uint> sortedPrimeCombinations;
@@ -1497,15 +1510,6 @@ combinationScorecard getBestCombinations(primeMultiplierPairRanking& primeMultip
         std::to_string(HASH_RANGE_1D) + ".bin";
     
     if (!fileExists(filename)) {       
-        size_t combinationCountTotal = 0;
-        for (int iGroup = 0; iGroup < primeMultiplierPairRanking.multiplierGroups.size(); iGroup++) {
-            multiplierGroup multiplierGroup = primeMultiplierPairRanking.multiplierGroups[iGroup];
-            int combinationCountHere = countCombinations(multiplierGroup.primeCount, cardinality);
-            combinationCountTotal += combinationCountHere;
-        }
-        
-        std::cout << "Total combinations: " << std::to_string(combinationCountTotal) << " (cardinality: " << cardinality << ")" << std::endl;
-
         // Open the scores file for memory mapping
         int fd_scores = open(primeMultiplierPairRanking.scoresFilePath.c_str(), O_RDONLY);
         if (fd_scores == -1) {
@@ -1531,112 +1535,269 @@ combinationScorecard getBestCombinations(primeMultiplierPairRanking& primeMultip
         
         std::cout << "Successfully memory-mapped scores file of size " << (sb.st_size / (1024.0 * 1024.0)) << " MB" << std::endl;
 
+        // Create thread pool
+        const int threadCount = std::thread::hardware_concurrency();
+        std::vector<std::thread> threads(threadCount);
+        
+        // Keep significantly more candidates at each step to ensure we don't miss good combinations
+        const int CANDIDATES_PER_STEP = 1024*1024*8; // Keep top n at each step
+        
+        // Start with all pairs (2D combinations)
+        std::vector<candidateCombination> currentCandidates;
+        
         indicators::show_console_cursor(false);
+        
+        // Step 1: Find best 2D combinations (pairs)
+        std::cout << "Step 1: Finding best 2D combinations (pairs)..." << std::endl;
         indicators::BlockProgressBar bar{
             indicators::option::BarWidth{80},
-            indicators::option::PostfixText{"Get Best Combinations"},
+            indicators::option::PostfixText{"Processing 2D combinations"},
             indicators::option::ShowElapsedTime{true},
             indicators::option::ShowRemainingTime{true},
             indicators::option::MaxProgress{primeMultiplierPairRanking.multiplierGroups.size()}
         };
-
-        // Create thread pool and results vector
-        const int threadCount = std::thread::hardware_concurrency();
-        std::vector<std::thread> threads(threadCount);
-        std::vector<threadBestCombinations> threadResults(threadCount);
+        
+        std::vector<std::vector<candidateCombination>> threadCandidates(threadCount);
         std::atomic<size_t> nextGroupIndex(0);
-
-        // Launch threads
+        
+        // Launch threads for 2D processing
         for (int iThread = 0; iThread < threadCount; iThread++) {
             threads[iThread] = std::thread([&, iThread, mapped_scores_ptr]() {
-                std::vector<int> groupPrimeIndices(cardinality);
-                size_t processedCount = 0;
-                
                 while (true) {
-                    // Get next group to process
                     size_t iGroup = nextGroupIndex.fetch_add(1);
                     if (iGroup >= primeMultiplierPairRanking.multiplierGroups.size()) break;
                     
-                    multiplierGroup& multiplierGroup = primeMultiplierPairRanking.multiplierGroups[iGroup];
-                    if (multiplierGroup.primeCount < cardinality) continue;
-
-                    for (int i = 0; i < cardinality; i++) groupPrimeIndices[i] = (cardinality - 1 - i);
-                    while (groupPrimeIndices[0] < multiplierGroup.primeCount) {
-                        double combinationPairScoreSum = 0;
-                        for (int iPrimeA = 1; iPrimeA < cardinality; iPrimeA++) {
-                            for (int iPrimeB = 0; iPrimeB < iPrimeA; iPrimeB++) {
-                                int iPairMapped = (int)mergeIndexPair(groupPrimeIndices[iPrimeA], groupPrimeIndices[iPrimeB]);
-                                // Access scores from the memory-mapped file instead of vector
-                                combinationPairScoreSum += mapped_scores_ptr[multiplierGroup.scoresIndexBase + iPairMapped];
-                            }
-                        }
-
-                        // Store combination if it's among thread's best
-                        if (threadResults[iThread].combinations.size() < COMBINATIONS_TO_OUTPUT || 
-                            combinationPairScoreSum < threadResults[iThread].combinations[0].scoreMultiplierPair.score) {
-                            std::vector<uint> primesInCombination(cardinality);
-                            for (int i = 0; i < cardinality; i++) {
-                                primesInCombination[i] = primeMultiplierPairRanking.primesForMultiplierGroups[
-                                    multiplierGroup.primesIndexBase + groupPrimeIndices[i]];
-                            }
-
-                            indexedScoreMultiplierPairEntry entry{
-                                scoredInteger{ (float)combinationPairScoreSum, multiplierGroup.multiplier },
-                                processedCount
+                    multiplierGroup& group = primeMultiplierPairRanking.multiplierGroups[iGroup];
+                    if (group.primeCount < 2) continue;
+                    
+                    // Process all pairs in this group
+                    for (int indexA = 1; indexA < group.primeCount; indexA++) {
+                        for (int indexB = 0; indexB < indexA; indexB++) {
+                            int pairIndex = mergeIndexPair(indexA, indexB);
+                            float score = mapped_scores_ptr[group.scoresIndexBase + pairIndex];
+                            
+                            std::vector<uint> primes = {
+                                primeMultiplierPairRanking.primesForMultiplierGroups[group.primesIndexBase + indexA],
+                                primeMultiplierPairRanking.primesForMultiplierGroups[group.primesIndexBase + indexB]
                             };
-
-                            if (threadResults[iThread].combinations.size() < COMBINATIONS_TO_OUTPUT) {
-                                threadResults[iThread].combinations.push_back(entry);
-                                std::push_heap(threadResults[iThread].combinations.begin(), threadResults[iThread].combinations.end(),
-                                    [](const auto& a, const auto& b) { return a.scoreMultiplierPair.score < b.scoreMultiplierPair.score; });
-                            } else {
-                                std::pop_heap(threadResults[iThread].combinations.begin(), threadResults[iThread].combinations.end(),
-                                    [](const auto& a, const auto& b) { return a.scoreMultiplierPair.score < b.scoreMultiplierPair.score; });
-                                threadResults[iThread].combinations.back() = entry;
-                                std::push_heap(threadResults[iThread].combinations.begin(), threadResults[iThread].combinations.end(),
-                                    [](const auto& a, const auto& b) { return a.scoreMultiplierPair.score < b.scoreMultiplierPair.score; });
-                            }
-
-                            // Store the primes for this combination
-                            if (threadResults[iThread].primes.size() < COMBINATIONS_TO_OUTPUT * cardinality) {
-                                threadResults[iThread].primes.insert(threadResults[iThread].primes.end(), 
-                                    primesInCombination.begin(), primesInCombination.end());
-                            }
-                        }
-
-                        processedCount++;
-                        // if (processedCount % 100000000 == 0) {
-                        //     std::lock_guard<std::mutex> lock(printMutex);
-                        //     double percentage = (double)processedCount / (double)combinationCountTotal * 100.0;
-                        //     std::cout << "Thread " << iThread << " processed " << processedCount << 
-                        //         " combinations (" << percentage << "%)..." << std::endl;
-                        // }
-
-                        // Next indices
-                        int lastIndex = -1;
-                        for (int i = cardinality - 1;; i--) {
-                            groupPrimeIndices[i]++;
-                            if (i <= 0 || groupPrimeIndices[i] < groupPrimeIndices[i - 1]) break;
-                            else groupPrimeIndices[i] = lastIndex + 1;
-                            lastIndex = groupPrimeIndices[i];
+                            
+                            threadCandidates[iThread].emplace_back(score, group.multiplier, primes);
                         }
                     }
-
-                    if (iGroup % 1000 == 0) {
+                    
+                    // Keep only best candidates in this thread
+                    if (threadCandidates[iThread].size() > CANDIDATES_PER_STEP) {
+                        std::partial_sort(threadCandidates[iThread].begin(), 
+                                        threadCandidates[iThread].begin() + CANDIDATES_PER_STEP,
+                                        threadCandidates[iThread].end(),
+                                        [](const candidateCombination& a, const candidateCombination& b) {
+                                            return a.score > b.score; // Higher scores first
+                                        });
+                        threadCandidates[iThread].resize(CANDIDATES_PER_STEP);
+                    }
+                    
+                    if (iGroup % 100 == 0) {
                         bar.set_progress(iGroup);
                     }
                 }
             });
         }
-
-        // Wait for all threads to complete
+        
         for (auto& thread : threads) {
             thread.join();
         }
-
+        
+        // Merge results from all threads for 2D
+        std::cout << "\nMerging 2D results from threads..." << std::endl;
+        for (const auto& threadResult : threadCandidates) {
+            currentCandidates.insert(currentCandidates.end(), threadResult.begin(), threadResult.end());
+        }
+        
+        // Keep only the best 2D combinations
+        std::partial_sort(currentCandidates.begin(), 
+                         currentCandidates.begin() + std::min((size_t)CANDIDATES_PER_STEP, currentCandidates.size()),
+                         currentCandidates.end(),
+                         [](const candidateCombination& a, const candidateCombination& b) {
+                             return a.score > b.score; // Higher scores first
+                         });
+        
+        if (currentCandidates.size() > CANDIDATES_PER_STEP) {
+            currentCandidates.resize(CANDIDATES_PER_STEP);
+        }
+        
+        std::cout << "Best 2D combinations found: " << currentCandidates.size() << std::endl;
+        
+        // Print top scoring 2D combination
+        if (!currentCandidates.empty()) {
+            const auto& best = currentCandidates[0];
+            std::cout << "TOP 2D - Score: " << best.score 
+                      << ", Multiplier: 0x" << std::hex << best.multiplier << std::dec
+                      << ", Primes: [0x" << std::hex << best.primes[0] << ", 0x" << best.primes[1] << "]" << std::dec << std::endl;
+        }
+        
+        // Now incrementally build up to the target cardinality
+        for (int currentCardinality = 3; currentCardinality <= cardinality; currentCardinality++) {
+            std::cout << "Step " << (currentCardinality - 1) << ": Expanding to " << currentCardinality << "D combinations..." << std::endl;
+            
+            indicators::BlockProgressBar progressBar{
+                indicators::option::BarWidth{80},
+                indicators::option::PostfixText{"Expanding combinations to " + std::to_string(currentCardinality) + "D"},
+                indicators::option::ShowElapsedTime{true},
+                indicators::option::ShowRemainingTime{true},
+                indicators::option::MaxProgress{currentCandidates.size()}
+            };
+            
+            std::vector<candidateCombination> nextCandidates;
+            std::vector<std::vector<candidateCombination>> threadNextCandidates(threadCount);
+            std::atomic<size_t> nextCandidateIndex(0);
+            
+            // Launch threads for expanding combinations
+            for (int iThread = 0; iThread < threadCount; iThread++) {
+                threads[iThread] = std::thread([&, iThread, mapped_scores_ptr, currentCardinality]() {
+                    while (true) {
+                        size_t candidateIndex = nextCandidateIndex.fetch_add(1);
+                        if (candidateIndex >= currentCandidates.size()) break;
+                        
+                        const candidateCombination& baseCombination = currentCandidates[candidateIndex];
+                        
+                        // Find the multiplier group for this combination
+                        auto groupIt = std::find_if(primeMultiplierPairRanking.multiplierGroups.begin(),
+                                                   primeMultiplierPairRanking.multiplierGroups.end(),
+                                                   [&](const multiplierGroup& g) { return g.multiplier == baseCombination.multiplier; });
+                        
+                        if (groupIt == primeMultiplierPairRanking.multiplierGroups.end()) continue;
+                        
+                        const multiplierGroup& group = *groupIt;
+                        
+                        // Try adding each remaining prime from the same group
+                        for (int newPrimeIndex = 0; newPrimeIndex < group.primeCount; newPrimeIndex++) {
+                            uint newPrime = primeMultiplierPairRanking.primesForMultiplierGroups[group.primesIndexBase + newPrimeIndex];
+                            
+                            // Skip if this prime is already in the combination
+                            if (std::find(baseCombination.primes.begin(), baseCombination.primes.end(), newPrime) != baseCombination.primes.end()) {
+                                continue;
+                            }
+                            
+                            // Calculate the score by adding all pairwise scores involving the new prime
+                            float additionalScore = 0.0f;
+                            bool validCombination = true;
+                            
+                            for (const uint& existingPrime : baseCombination.primes) {
+                                // Find indices of these primes in the group
+                                int existingIndex = -1, newIndex = -1;
+                                for (int i = 0; i < group.primeCount; i++) {
+                                    uint groupPrime = primeMultiplierPairRanking.primesForMultiplierGroups[group.primesIndexBase + i];
+                                    if (groupPrime == existingPrime) existingIndex = i;
+                                    if (groupPrime == newPrime) newIndex = i;
+                                }
+                                
+                                if (existingIndex == -1 || newIndex == -1) {
+                                    validCombination = false;
+                                    break;
+                                }
+                                
+                                // Get the pairwise score
+                                int pairIndex = mergeIndexPair(std::max(existingIndex, newIndex), std::min(existingIndex, newIndex));
+                                float pairScore = mapped_scores_ptr[group.scoresIndexBase + pairIndex];
+                                additionalScore += pairScore;
+                            }
+                            
+                            if (!validCombination) continue;
+                            
+                            // Create new combination
+                            std::vector<uint> newPrimes = baseCombination.primes;
+                            newPrimes.push_back(newPrime);
+                            float newScore = baseCombination.score + additionalScore;
+                            
+                            threadNextCandidates[iThread].emplace_back(newScore, baseCombination.multiplier, newPrimes);
+                        }
+                        
+                        if (candidateIndex % 100 == 0) {
+                            progressBar.set_progress(candidateIndex);
+                        }
+                    }
+                    
+                    // Keep only best candidates in this thread
+                    if (threadNextCandidates[iThread].size() > CANDIDATES_PER_STEP) {
+                        std::partial_sort(threadNextCandidates[iThread].begin(), 
+                                        threadNextCandidates[iThread].begin() + CANDIDATES_PER_STEP,
+                                        threadNextCandidates[iThread].end(),
+                                        [](const candidateCombination& a, const candidateCombination& b) {
+                                            return a.score > b.score; // Higher scores first
+                                        });
+                        threadNextCandidates[iThread].resize(CANDIDATES_PER_STEP);
+                    }
+                });
+            }
+            
+            for (auto& thread : threads) {
+                thread.join();
+            }
+            
+            // Merge results from all threads
+            std::cout << "\nMerging " << currentCardinality << "D results from threads..." << std::endl;
+            nextCandidates.clear();
+            for (const auto& threadResult : threadNextCandidates) {
+                nextCandidates.insert(nextCandidates.end(), threadResult.begin(), threadResult.end());
+            }
+            
+            // Keep only the best combinations for the next iteration
+            if (currentCardinality == cardinality) {
+                // Final step - keep only the final output count
+                std::partial_sort(nextCandidates.begin(), 
+                                 nextCandidates.begin() + std::min((size_t)COMBINATIONS_TO_OUTPUT, nextCandidates.size()),
+                                 nextCandidates.end(),
+                                 [](const candidateCombination& a, const candidateCombination& b) {
+                                     return a.score > b.score; // Higher scores first
+                                 });
+                if (nextCandidates.size() > COMBINATIONS_TO_OUTPUT) {
+                    nextCandidates.resize(COMBINATIONS_TO_OUTPUT);
+                }
+            } else {
+                // Intermediate step - keep more candidates
+                std::partial_sort(nextCandidates.begin(), 
+                                 nextCandidates.begin() + std::min((size_t)CANDIDATES_PER_STEP, nextCandidates.size()),
+                                 nextCandidates.end(),
+                                 [](const candidateCombination& a, const candidateCombination& b) {
+                                     return a.score > b.score; // Higher scores first
+                                 });
+                if (nextCandidates.size() > CANDIDATES_PER_STEP) {
+                    nextCandidates.resize(CANDIDATES_PER_STEP);
+                }
+            }
+            
+            currentCandidates = std::move(nextCandidates);
+            std::cout << "Best " << currentCardinality << "D combinations found: " << currentCandidates.size() << std::endl;
+            
+            // Print top scoring combination for this cardinality
+            if (!currentCandidates.empty()) {
+                const auto& best = currentCandidates[0];
+                std::cout << "TOP " << currentCardinality << "D - Score: " << best.score 
+                          << ", Multiplier: 0x" << std::hex << best.multiplier << std::dec << ", Primes: [";
+                for (int i = 0; i < best.primes.size(); i++) {
+                    std::cout << "0x" << std::hex << best.primes[i];
+                    if (i < best.primes.size() - 1) std::cout << ", ";
+                }
+                std::cout << "]" << std::dec << std::endl;
+            }
+            
+            // Clear thread candidates for next iteration
+            for (auto& threadCands : threadNextCandidates) {
+                threadCands.clear();
+            }
+        }
+        
         indicators::show_console_cursor(true);
-
-        std::cout << "Merging threads' results..." << std::endl;
+        
+        // Convert final candidates to output format
+        sortedScoreMultiplierPairs.reserve(currentCandidates.size());
+        sortedPrimeCombinations.reserve(currentCandidates.size() * cardinality);
+        
+        for (const auto& candidate : currentCandidates) {
+            sortedScoreMultiplierPairs.push_back(scoredInteger{ candidate.score, candidate.multiplier });
+            sortedPrimeCombinations.insert(sortedPrimeCombinations.end(), 
+                                         candidate.primes.begin(), candidate.primes.end());
+        }
         
         // Unmap the file when done
         if (munmap(mapped_scores_ptr, sb.st_size) == -1) {
@@ -1645,35 +1806,6 @@ combinationScorecard getBestCombinations(primeMultiplierPairRanking& primeMultip
         
         // Close the file descriptor
         close(fd_scores);
-
-        // Merge results from all threads
-        std::vector<indexedScoreMultiplierPairEntry> mergedCombinations;
-        for (const auto& threadResult : threadResults) {
-            mergedCombinations.insert(mergedCombinations.end(), 
-                threadResult.combinations.begin(), threadResult.combinations.end());
-        }
-
-        // Sort and keep best COMBINATIONS_TO_OUTPUT
-        std::sort(mergedCombinations.begin(), mergedCombinations.end(),
-            [](const auto& a, const auto& b) { return a.scoreMultiplierPair.score < b.scoreMultiplierPair.score; });
-        if (mergedCombinations.size() > COMBINATIONS_TO_OUTPUT) {
-            mergedCombinations.resize(COMBINATIONS_TO_OUTPUT);
-        }
-
-        // Extract final sorted results
-        sortedScoreMultiplierPairs.reserve(mergedCombinations.size());
-        for (const auto& entry : mergedCombinations) {
-            sortedScoreMultiplierPairs.push_back(entry.scoreMultiplierPair);
-        }
-
-        // Merge prime combinations in the same order
-        for (const auto& threadResult : threadResults) {
-            sortedPrimeCombinations.insert(sortedPrimeCombinations.end(),
-                threadResult.primes.begin(), threadResult.primes.end());
-        }
-        if (sortedPrimeCombinations.size() > COMBINATIONS_TO_OUTPUT * cardinality) {
-            sortedPrimeCombinations.resize(COMBINATIONS_TO_OUTPUT * cardinality);
-        }
 
         // Save results
         std::ofstream outFile(filename, std::ios::binary);
